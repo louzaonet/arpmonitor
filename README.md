@@ -145,6 +145,7 @@ Después tendrás que volver a hacer `/etc/init.d/arpmonitor enable` y reinstala
 - Los móviles modernos usan MAC aleatoria por red, y algunos la rotan cada cierto tiempo. Cada rotación te va a llegar como dispositivo nuevo. Si te molesta, desactiva la MAC privada para tu WiFi en esos equipos.
 - Un equipo con IP fija, sin DHCP, que conecte y se vaya entre dos lecturas no lo vas a ver. Con el intervalo por defecto es raro.
 - Solo IPv4. Los leases de IPv6 (odhcpd) no los leo.
+- El hostname lo elige el propio equipo al pedir IP, así que no me fío de él. Antes de llegar a la base, al log o al correo se queda en `[A-Za-z0-9._-]` y como mucho 63 caracteres. Las MAC, las IP y las interfaces que no tienen formato válido se descartan.
 - Esto no es un IDS. Una MAC se falsifica en un segundo, así que tómalo como un aviso útil y no como control de acceso.
 
 ### Licencia
@@ -294,6 +295,7 @@ Afterwards you'll still need to run `/etc/init.d/arpmonitor enable` again and re
 - Modern phones use a random MAC per network, and some rotate it every so often. Every rotation will show up as a new device. If that bugs you, turn off the private MAC for your WiFi on those devices.
 - A device with a static IP, no DHCP, that joins and leaves between two reads won't be seen. With the default interval that's rare.
 - IPv4 only. I don't read the IPv6 (odhcpd) leases.
+- The hostname is picked by the device itself when it asks for an IP, so I don't trust it. Before it reaches the database, the log or the email it's cut down to `[A-Za-z0-9._-]`, 63 chars max. Malformed MACs, IPs and interface names are dropped.
 - This isn't an IDS. A MAC can be spoofed in a second, so treat it as a handy heads-up, not access control.
 
 ### License

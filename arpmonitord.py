@@ -47,10 +47,56 @@ LINE_RE = re.compile(
     r"(?P<mac>(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2})"
 )
 MAC_RE = re.compile(r"^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$")
-IP_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
-NULL_MAC = "00:00:00:00:00:00"
+IFACE_RE = re.compile(r"^[A-Za-z0-9._@-]{1,15}$")  # IFNAMSIZ = 16 con el NUL
+HOST_BAD_RE = re.compile(r"[^A-Za-z0-9._-]")
+HOST_MAX = 63  # longitud maxima de una etiqueta DNS
+IGNORED_MACS = {"00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"}
+MAX_READ = 1 << 20  # 1 MiB: tope de lectura por fichero
 
 stop = threading.Event()
+
+
+# --- Saneado -------------------------------------------------------------
+# Todo lo que llega de ARP y, sobre todo, de los leases lo controla en parte
+# un cliente de la red (el hostname DHCP lo elige el propio equipo). Se valida
+# a la entrada y otra vez antes de mandar el correo. Las consultas SQL van
+# siempre con parametros, asi que el saneado es para logs y correo.
+
+def clean_mac(value):
+    """MAC en minusculas y formato aa:bb:cc:dd:ee:ff, o None si no vale."""
+    mac = value.strip().lower()
+    if not MAC_RE.match(mac) or mac in IGNORED_MACS:
+        return None
+    return mac
+
+
+def clean_ip(value):
+    """IPv4 canonica (sin ceros a la izquierda, octetos 0-255), o None."""
+    parts = value.strip().split(".")
+    if len(parts) != 4:
+        return None
+    for p in parts:
+        if not p.isdigit() or not p.isascii() or len(p) > 3:
+            return None
+        if (len(p) > 1 and p[0] == "0") or int(p) > 255:
+            return None
+    return value.strip()
+
+
+def clean_iface(value):
+    """Nombre de interfaz valido segun Linux, o '?' si no lo es."""
+    return value if IFACE_RE.match(value) else "?"
+
+
+def clean_host(value):
+    """
+    Hostname apto para logs, base y cabeceras de correo: solo [A-Za-z0-9._-],
+    lo demas se sustituye por '_', y como mucho HOST_MAX caracteres.
+    '*' (sin hostname en dnsmasq) pasa a cadena vacia.
+    """
+    if not value or value == "*":
+        return ""
+    return HOST_BAD_RE.sub("_", value)[:HOST_MAX]
 
 
 def log(msg):
@@ -58,14 +104,23 @@ def log(msg):
     print(msg, file=sys.stderr, flush=True)
 
 
+def read_text(path):
+    """
+    Lee un fichero de texto sin reventar nunca por la codificacion: un byte
+    no UTF-8 en un hostname tumbaria el daemon con UnicodeDecodeError.
+    """
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return f.read(MAX_READ)
+
+
 def read_arp(path):
     """Devuelve el texto de la tabla ARP: /proc/net/arp o, si no hay, `arp -n`."""
     try:
-        with open(path) as f:
-            return f.read()
+        return read_text(path)
     except OSError:
         pass
-    out = subprocess.run(["arp", "-n"], capture_output=True, text=True, timeout=10)
+    out = subprocess.run(["arp", "-n"], capture_output=True, text=True,
+                         errors="replace", timeout=10)
     if out.returncode != 0:
         raise RuntimeError("arp fallo: " + out.stderr.strip())
     return out.stdout
@@ -83,13 +138,14 @@ def parse_arp(text):
         m = LINE_RE.search(line)
         if not m:
             continue
-        mac = m.group("mac").lower()
-        cols = line.split()
-        if mac == NULL_MAC or "incomplete" in line.lower():
+        mac = clean_mac(m.group("mac"))
+        ip = clean_ip(m.group("ip"))
+        if mac is None or ip is None or "incomplete" in line.lower():
             continue
+        cols = line.split()
         if len(cols) >= 3 and cols[2] == "0x0":
             continue
-        found[mac] = (m.group("ip"), cols[-1])
+        found[mac] = (ip, clean_iface(cols[-1]))
     return found
 
 
@@ -103,20 +159,23 @@ def parse_leases(path):
     leases = {}
     now = time.time()
     try:
-        with open(path) as f:
-            for line in f:
-                parts = line.split()
-                if len(parts) < 4:
-                    continue
-                expiry, mac, ip, host = parts[0], parts[1].lower(), parts[2], parts[3]
-                if not expiry.isdigit() or (int(expiry) != 0 and int(expiry) < now):
-                    continue
-                # Descarta lineas raras (DUID en vez de MAC, IPv6, etc.)
-                if not MAC_RE.match(mac) or not IP_RE.match(ip):
-                    continue
-                leases[mac] = (ip, "" if host == "*" else host)
+        text = read_text(path)
     except OSError:
-        pass
+        return leases
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        expiry = parts[0]
+        if not (expiry.isascii() and expiry.isdigit()):
+            continue
+        if int(expiry) != 0 and int(expiry) < now:
+            continue
+        # Descarta lineas raras (DUID en vez de MAC, IPv6, basura)
+        mac, ip = clean_mac(parts[1]), clean_ip(parts[2])
+        if mac is None or ip is None:
+            continue
+        leases[mac] = (ip, clean_host(parts[3]))
     return leases
 
 
@@ -166,6 +225,13 @@ def open_db(path):
 
 
 def send_mail(to, mac, ip, iface, hostname, first_seen):
+    # Segunda pasada de saneado: filas de versiones antiguas de la base no
+    # pasaron por los filtros de entrada.
+    mac = clean_mac(mac or "") or "?"
+    ip = clean_ip(ip or "") or "?"
+    iface = clean_iface(iface or "")
+    hostname = clean_host(hostname or "")
+    first_seen = re.sub(r"[^0-9: -]", "", first_seen or "")[:19]
     msg = EmailMessage()
     msg["To"] = to
     label = "%s (%s)" % (mac, hostname) if hostname else mac
